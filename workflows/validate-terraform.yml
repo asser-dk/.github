@@ -1,0 +1,231 @@
+# TODO: Does not pick up .tflint.hcl if present in repo and input.tflint-config is not set.
+
+name: Validate Terraform
+
+on:
+  workflow_call:
+    inputs:
+      use-terraform-cli:
+        required: false
+        description: "Use `terraform` CLI instead of `tofu` cli."
+        type: boolean
+        default: false
+
+      root-module-path:
+        required: false
+        description: "The path to where the terraform files are stored."
+        type: string
+        default: ""
+
+      aws-tflint-ruleset:
+        required: false
+        type: boolean
+        default: true
+        description: "Enable the AWS tflint ruleset."
+      tflint-preset:
+        required: false
+        type: string
+        default: "all"
+        description: "The tflint-preset to use for the terraform plugin. (Options are: `all`, or `recommended`)"
+
+      tflint-config:
+        required: false
+        description: "The `.tflint.hcl` file to use. If not specified then a default one will be generated, based on the enabled plugins and tflint-preset."
+        type: string
+
+      vulnerability-severities:
+        description: "The severities to report for vulnerability scanning"
+        required: false
+        type: string
+        default: "CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN"
+
+jobs:
+  trivy:
+    name: Trivy vulnerability scanning
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          github-pat: ${{ github.token }}
+          severity: ${{ inputs.vulnerability-severities }}
+          hide-progress: true
+          output: 'trivy-results.txt'
+          exit-code: '1'
+
+      - name: Publish report
+        if: success() || failure()
+        run: |
+          if [[ -s trivy-results.txt ]]; then
+            {
+              echo '# Vulnerability report'
+              echo ''
+              echo '```terraform'
+              cat trivy-results.txt
+              echo '```'
+            } >> $GITHUB_STEP_SUMMARY
+          fi
+
+  tflint:
+    name: TFLint
+    runs-on: ubuntu-latest
+
+    env:
+      TFLINT_CONFIG_CACHE_KEY: "2025.1" # Bump up whenever the plugins in the generated .tflint.hcl file change.
+      TFLINT_CONFIG_PATH: ""
+      USE_GENERATED_TFLINT_CONFIG: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate tflint tflint-preset value
+        if: "inputs.tflint-preset != 'all' && inputs.tflint-preset != 'recommended'"
+        run: |
+          echo "::error::Invalid preset value ${{ inputs.tflint-preset }}"
+          echo "Valid values are: `all`, `recommended`"
+          exit 1
+
+      - name: Validate TFLint config path
+        if: inputs.tflint-config
+        run: |
+          if [ ! -f "${{ inputs.tflint-config }}" ]; then
+            echo "::error::specified TFLint config file not found: ${{ inputs.tflint-config }}"
+            echo "Please ensure the file exists in the repository at the specified location"
+            exit 1
+          fi
+
+          echo "TFLINT_CONFIG_PATH=$(pwd)/${{ inputs.tflint-config }}" >> $GITHUB_ENV
+          echo "USE_GENERATED_TFLINT_CONFIG=false" >> $GITHUB_ENV
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@master
+        with:
+          tflint_version: 'latest'
+
+        # IMPORTANT: Bump up env.TFLINT_CONFIG_CACHE_KEY number when the included plugins change
+        # (ALWAYS define the plugin block - toggle the enabled property instead)
+      - name: Generate default .tflint.hcl
+        if: "!inputs.tflint-config"
+        working-directory: ${{ inputs.root-module-path }}
+        run: |
+          cat << EOF > .tflint.hcl
+          plugin "terraform" {
+            enabled = true
+            preset  = "${{ inputs.tflint-preset }}"
+          }
+
+          plugin "aws" {
+            enabled = ${{ inputs.aws-tflint-ruleset }}
+            version = "0.38.0"
+            source  = "github.com/terraform-linters/tflint-ruleset-aws"
+          }
+          EOF
+
+          echo "TFLINT_CONFIG_PATH=$(pwd)/.tflint.hcl" >> $GITHUB_ENV
+          echo "USE_GENERATED_TFLINT_CONFIG=true" >> $GITHUB_ENV
+
+      - name: Cache TFLint plugins
+        uses: actions/cache@v4
+        with:
+          path: ~/.tflint.d/plugins
+          key: tflint-${{ runner.os }}-${{ env.TFLINT_CONFIG_CACHE_KEY }}-${{ env.USE_GENERATED_TFLINT_CONFIG }}
+          restore-keys: |
+            tflint-${{ runner.os }}-${{ env.TFLINT_CONFIG_CACHE_KEY }}-
+
+      - name: Tflint init
+        working-directory: ${{ inputs.root-module-path }}
+        run: tflint --init --config=${{ env.TFLINT_CONFIG_PATH }}
+
+      - name: Run TFLint
+        id: tflint
+        working-directory: ${{ inputs.root-module-path }}
+        run: |
+          tflint --recursive --config=${{ env.TFLINT_CONFIG_PATH }} 2>&1 | tee tflint-results.txt
+          exit ${PIPESTATUS[0]}
+
+      - name: Publish report
+        if: success() || failure()
+        working-directory: ${{ inputs.root-module-path }}
+        run: |
+          if [[ -s tflint-results.txt ]]; then
+            {
+              echo '# TFLint report'
+              echo ''
+              echo '```terraform'
+              cat tflint-results.txt
+              echo '```'
+            } >> $GITHUB_STEP_SUMMARY
+          fi
+
+  validate-terraform:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+
+    env:
+      CLI: ${{ inputs.use-terraform-cli && 'terraform' || 'tofu' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        if: inputs.use-terraform-cli
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Setup Tofu
+        if: inputs.use-terraform-cli == false
+        uses: opentofu/setup-opentofu@v1
+
+      - name: Init
+        working-directory: ${{ inputs.root-module-path }}
+        run: ${{ env.CLI }} init -backend=false
+
+      - name: Validate
+        id: validate
+        working-directory: ${{ inputs.root-module-path }}
+        run: |
+          ${{ env.CLI }} validate -no-color | grep -v "^::error::" | tee validate-results.txt
+          exit ${PIPESTATUS[0]}
+
+      - name: Publish validate report
+        if: always() && steps.validate.outcome == 'failure'
+        working-directory: ${{ inputs.root-module-path }}
+        run: |
+          if [[ -s validate-results.txt ]]; then
+            {
+              echo '# Validation report'
+              echo ''
+              echo '```terraform'
+              cat validate-results.txt
+              echo '```'
+            } >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Fmt recursive check
+        id: fmt
+        if: always() && !cancelled()
+        working-directory: ${{ inputs.root-module-path }}
+        run: |
+          ${{ env.CLI }} fmt -check -recursive -no-color 2>&1 | grep -v "^::error::" | tee fmt-results.txt
+          exit ${PIPESTATUS[0]}
+
+      - name: Publish fmt report
+        if: always() && steps.fmt.outcome == 'failure'
+        working-directory: ${{ inputs.root-module-path }}
+        run: |
+
+          if [[ -s fmt-results.txt ]]; then
+            {
+              echo '# Unformatted files'
+              echo ''
+              echo '```'
+              cat fmt-results.txt
+              echo '```'
+            } >> $GITHUB_STEP_SUMMARY
+          fi
